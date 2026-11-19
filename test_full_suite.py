@@ -251,6 +251,119 @@ def a14():
 check("A14: N/A flag logic — aggregate data vs daily station data", a14)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION A2 — District-Level Consistency Check Tests
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "═"*60)
+print("  SECTION A2 — District-Level Check Tests")
+print("═"*60)
+
+from agents import (
+    run_district_checks,
+    _check_departure_mismatch,
+    _check_seasonal_sum_mismatch,
+    _check_negative_or_missing,
+    _check_extreme_departure,
+)
+
+
+def _make_dist_df(rows):
+    """Build a minimal district DataFrame for testing."""
+    return pd.DataFrame(rows)
+
+
+# A15: Departure mismatch — detects where filed dep differs from (A-N)/N*100 by >1 pp
+def a15():
+    df = _make_dist_df([
+        # Normal=100, Actual=125 → recomputed=25.0, filed=20 → diff=5 → flag
+        {"district": "TestDist1", "annual normal": 100, "annual actual": 125,
+         "annual departure (%)": 20, "rainfall_mm": 125},
+        # Normal=100, Actual=90 → recomputed=-10.0, filed=-10 → diff=0 → no flag
+        {"district": "TestDist2", "annual normal": 100, "annual actual": 90,
+         "annual departure (%)": -10, "rainfall_mm": 90},
+        # Normal=200, Actual=260 → recomputed=30.0, filed=30 → diff=0 → no flag
+        {"district": "TestDist3", "annual normal": 200, "annual actual": 260,
+         "annual departure (%)": 30, "rainfall_mm": 260},
+    ])
+    result = _check_departure_mismatch(df)
+    assert result["count"] == 1, f"Expected 1 mismatch, got {result['count']}: {result['details']}"
+    assert result["details"][0]["district"] == "TestDist1"
+    assert result["details"][0]["recomputed_value"] == 25.0
+    print(f"  Departure mismatch: 1 flagged ✓, {result['details'][0]['reason'][:60]}")
+check("A15: Departure mismatch check (1 flagged, 2 clean)", a15)
+
+
+# A16: Seasonal sum mismatch — flags when Pre+SWM+NEM differ from Annual by >2%
+def a16():
+    df = _make_dist_df([
+        # 100 + 400 + 50 = 550 vs annual=600 → diff=8.3% → flag
+        {"district": "DistA", "annual actual": 600,
+         "pre monsoon actual": 100, "swm actual": 400, "nem actual": 50,
+         "rainfall_mm": 600},
+        # 100 + 400 + 100 = 600 vs annual=600 → diff=0% → clean
+        {"district": "DistB", "annual actual": 600,
+         "pre monsoon actual": 100, "swm actual": 400, "nem actual": 100,
+         "rainfall_mm": 600},
+    ])
+    result = _check_seasonal_sum_mismatch(df)
+    assert not result.get("skipped"), f"Should not skip: {result}"
+    assert result["count"] == 1, f"Expected 1, got {result['count']}: {result['details']}"
+    assert result["details"][0]["district"] == "DistA"
+    print(f"  Seasonal sum mismatch: 1 flagged ✓")
+check("A16: Seasonal sum mismatch check (1 flagged, 1 clean)", a16)
+
+
+# A17: Negative or missing values in annual actual
+def a17():
+    df = _make_dist_df([
+        {"district": "DistNeg",   "rainfall_mm": -5.0},
+        {"district": "DistBlank", "rainfall_mm": None},
+        {"district": "DistOk",    "rainfall_mm": 850.0},
+    ])
+    result = _check_negative_or_missing(df)
+    assert result["count"] == 2, f"Expected 2, got {result['count']}: {result['details']}"
+    flagged = {r["district"] for r in result["details"]}
+    assert flagged == {"DistNeg", "DistBlank"}, f"Wrong districts flagged: {flagged}"
+    print(f"  Negative/missing: 2 flagged ({flagged}) ✓")
+check("A17: Negative/missing rainfall check (2 flagged, 1 clean)", a17)
+
+
+# A18: Extreme departure — flags |dep| > 60%
+def a18():
+    df = _make_dist_df([
+        {"district": "DistHigh",  "annual departure (%)": 85.0},   # +85 → flag
+        {"district": "DistLow",   "annual departure (%)": -70.0},  # -70 → flag
+        {"district": "DistOk",    "annual departure (%)": 25.0},   # +25 → clean
+        {"district": "DistEdge",  "annual departure (%)": -60.0},  # exactly -60 → clean (not >60)
+    ])
+    result = _check_extreme_departure(df)
+    assert result["count"] == 2, f"Expected 2, got {result['count']}: {result['details']}"
+    flagged = {r["district"] for r in result["details"]}
+    assert flagged == {"DistHigh", "DistLow"}, f"Wrong districts: {flagged}"
+    print(f"  Extreme departure: 2 flagged ({flagged}) ✓")
+check("A18: Extreme departure check (2 flagged, 2 clean)", a18)
+
+
+# A19: Benchmark path gives exactly 15 defects (district checks do NOT affect benchmark)
+def a19():
+    from sample_data import generate_benchmark_data
+    from agents import run_quality_agent
+    raw_df, labels = generate_benchmark_data()
+    # Run WITHOUT is_aggregate — simulates benchmark path
+    qr = run_quality_agent(raw_df, is_aggregate=False)
+    assert qr["district_checks"] is None, "district_checks must be None for non-aggregate"
+    assert qr["total_defects_found"] == 15, f"Expected 15, got {qr['total_defects_found']}"
+    checks = qr["checks"]
+    assert checks["duplicates"]["count"] == 3
+    assert checks["negatives"]["count"] == 3
+    assert checks["date_gaps"]["count"] == 3
+    assert checks["conflicts"]["count"] == 3
+    assert checks["outliers"]["sensor_error_count"] == 3
+    assert checks["outliers"]["legitimate_extreme_count"] == 2
+    print(f"  Benchmark: 15 defects, district_checks=None ✓")
+check("A19: Benchmark path unchanged — 15 defects, district_checks=None", a19)
+
+
 # ════════════════════════════════════════════════════════════════════
 print("\n" + "═"*60)
 print("  SECTION B — Full Integration Tests (12 existing checks)")

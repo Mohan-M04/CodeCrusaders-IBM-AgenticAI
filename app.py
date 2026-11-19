@@ -25,6 +25,8 @@ from agents import (
     run_quality_agent,
     run_audit_agent,
     apply_approved_fixes,
+    apply_approved_district_fixes,
+    run_district_checks,
     get_perf_summary,
     translate_audit_summary,
 )
@@ -1050,7 +1052,7 @@ with tab2:
             time.sleep(0.3)
             st.write("5️⃣  Triaging outliers and extreme rainfall events…")
             st.write("🤖 Sending triage summary to IBM Granite 4 H Small…")
-            result = run_quality_agent(raw_df)
+            result = run_quality_agent(raw_df, is_aggregate=_is_aggregate_data())
             st.session_state.quality_result = result
             status.update(label="✅ 5-Point Quality Investigation complete!", state="complete", expanded=False)
 
@@ -1198,6 +1200,123 @@ with tab2:
             else:
                 st.write(str(triage))
 
+        # ── District-Level Consistency Checks ─────────────────────────────────
+        # Shown only when aggregate data is loaded and district checks were run
+        dc_result = qr.get("district_checks")
+        if dc_result is not None:
+            st.divider()
+            st.subheader("🏛️ District-Level Consistency Checks")
+            st.caption(
+                "These checks apply only to district-level aggregated files (one row per district). "
+                "Findings are labelled 'inconsistency to verify' — the file may use a different "
+                "rounding or aggregation convention. No value is auto-corrected without approval."
+            )
+
+            dc_checks = dc_result.get("checks", {})
+            total_incon = dc_result.get("total_inconsistencies", 0)
+            ext_dep_count = dc_result.get("extreme_departure_count", 0)
+
+            # Summary metrics
+            dcc1, dcc2, dcc3, dcc4 = st.columns(4)
+            dcc1.metric("Departure Mismatches",   dc_checks.get("departure_mismatch", {}).get("count", 0))
+            dcc2.metric("Seasonal Sum Mismatches", dc_checks.get("seasonal_sum_mismatch", {}).get("count", 0))
+            dcc3.metric("Negative / Missing",      dc_checks.get("negative_or_missing", {}).get("count", 0))
+            dcc4.metric("Extreme Departures (verify)", ext_dep_count)
+
+            # (a) Departure mismatch
+            dm = dc_checks.get("departure_mismatch", {})
+            with st.expander(
+                f"(a) Departure Mismatch — {dm.get('count', 0)} inconsistencies",
+                expanded=dm.get("count", 0) > 0
+            ):
+                if dm.get("skipped"):
+                    st.info(f"ℹ️ Skipped: {dm.get('skip_reason', '')}")
+                elif dm.get("count", 0) == 0:
+                    st.success("✅ All Annual Departure (%) values match recomputed formula.")
+                else:
+                    st.warning(
+                        f"⚠️ {dm['count']} district(s) where the filed departure % differs "
+                        f"from (Actual−Normal)/Normal×100 by more than 1 percentage point."
+                    )
+                    dm_rows = [
+                        {
+                            "District": r["district"],
+                            "Filed Dep (%)": r["filed_value"],
+                            "Recomputed (%)": r["recomputed_value"],
+                            "Diff (pp)": r["diff_pct_points"],
+                            "Normal": r["annual_normal"],
+                            "Actual": r["annual_actual"],
+                        }
+                        for r in dm.get("details", [])
+                    ]
+                    st.dataframe(pd.DataFrame(dm_rows), use_container_width=True, hide_index=True)
+
+            # (b) Seasonal sum mismatch
+            ss = dc_checks.get("seasonal_sum_mismatch", {})
+            with st.expander(
+                f"(b) Seasonal Sum Mismatch — {ss.get('count', 0)} inconsistencies",
+                expanded=ss.get("count", 0) > 0
+            ):
+                if ss.get("skipped"):
+                    st.info(f"ℹ️ {ss.get('skip_reason', 'Seasonal columns not available.')}")
+                elif ss.get("count", 0) == 0:
+                    st.success("✅ Seasonal actual sums match Annual Actual within 2% tolerance.")
+                else:
+                    st.warning(
+                        f"⚠️ {ss['count']} district(s) where seasonal actuals sum differs from "
+                        f"Annual Actual by more than 2%. Verify aggregation scope."
+                    )
+                    ss_rows = [
+                        {
+                            "District": r["district"],
+                            "Annual Actual": r["filed_value"],
+                            "Seasonal Sum": r["recomputed_value"],
+                            "Diff (%)": r["diff_pct"],
+                        }
+                        for r in ss.get("details", [])
+                    ]
+                    st.dataframe(pd.DataFrame(ss_rows), use_container_width=True, hide_index=True)
+
+            # (c) Negative or missing
+            nm = dc_checks.get("negative_or_missing", {})
+            with st.expander(
+                f"(c) Negative / Missing Values — {nm.get('count', 0)} found",
+                expanded=nm.get("count", 0) > 0
+            ):
+                if nm.get("skipped"):
+                    st.info(f"ℹ️ Skipped: {nm.get('skip_reason', '')}")
+                elif nm.get("count", 0) == 0:
+                    st.success("✅ No negative or missing rainfall values.")
+                else:
+                    st.error(f"🔴 {nm['count']} negative or non-numeric annual actual value(s).")
+                    nm_rows = [
+                        {"District": r["district"], "Value": r["filed_value"], "Reason": r["reason"]}
+                        for r in nm.get("details", [])
+                    ]
+                    st.dataframe(pd.DataFrame(nm_rows), use_container_width=True, hide_index=True)
+
+            # (d) Extreme departure
+            ed = dc_checks.get("extreme_departure", {})
+            with st.expander(
+                f"(d) Extreme Departures (±60%) — {ed.get('count', 0)} to verify",
+                expanded=ed.get("count", 0) > 0
+            ):
+                if ed.get("skipped"):
+                    st.info(f"ℹ️ Skipped: {ed.get('skip_reason', '')}")
+                elif ed.get("count", 0) == 0:
+                    st.success("✅ No extreme departure values (all within ±60%).")
+                else:
+                    st.info(
+                        f"ℹ️ {ed['count']} district(s) with departure beyond ±60%. "
+                        "These are flagged for verification only — **do NOT auto-delete**. "
+                        "They may reflect genuine drought or flood conditions."
+                    )
+                    ed_rows = [
+                        {"District": r["district"], "Departure (%)": r["filed_value"], "Reason": r["reason"]}
+                        for r in ed.get("details", [])
+                    ]
+                    st.dataframe(pd.DataFrame(ed_rows), use_container_width=True, hide_index=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3: Reversible Audit Log & Human Gate (Agent 3)
@@ -1297,28 +1416,35 @@ with tab3:
         )
 
         # Colour legend
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.write("🔴 **NEGATIVE / SENSOR ERROR** → Impute Null")
         c2.write("🟡 **DUPLICATE / CONFLICT** → Remove Row")
         c3.write("✅ **LEGITIMATE EXTREME** → Always Retained")
+        c4.write("🏛️ **DISTRICT INCONSISTENCY** → Verify / Correct")
 
         st.divider()
 
         # Render each audit entry with approve/reject radio
         defect_icons = {
-            "NEGATIVE_VALUE":     "🔴",
-            "DUPLICATE_RECORD":   "🟠",
-            "DATE_GAP":           "🟡",
-            "CONFLICTING_RECORD": "🟣",
-            "SENSOR_ERROR":       "⛔",
-            "LEGITIMATE_EXTREME": "✅",
+            "NEGATIVE_VALUE":        "🔴",
+            "DUPLICATE_RECORD":      "🟠",
+            "DATE_GAP":              "🟡",
+            "CONFLICTING_RECORD":    "🟣",
+            "SENSOR_ERROR":          "⛔",
+            "LEGITIMATE_EXTREME":    "✅",
+            # District-level types
+            "DEPARTURE_MISMATCH":    "🏛️",
+            "SEASONAL_SUM_MISMATCH": "📅",
+            "NEGATIVE_OR_MISSING":   "🔴",
+            "EXTREME_DEPARTURE":     "🌊",
         }
 
         for entry in audit_log:
             eid          = entry["id"]
             dtype        = entry["defect_type"]
             icon         = defect_icons.get(dtype, "❓")
-            is_extreme   = dtype == "LEGITIMATE_EXTREME"
+            # Non-negotiable: legitimate extremes AND extreme departures are always locked
+            is_extreme   = dtype in ("LEGITIMATE_EXTREME", "EXTREME_DEPARTURE")
             station_id   = entry.get("station_id", "—")
             dt           = entry.get("date", "—")
             orig_val     = entry.get("original_value", "—")
@@ -1365,7 +1491,15 @@ with tab3:
                     entry["user_decision"] = st.session_state.user_decisions.get(eid, "Reject")
 
                 with st.status("Applying fixes…", expanded=False) as apply_status:
+                    # Daily-data fixes (always run; no-op for district-level files)
                     cleaned_df, applied_changes = apply_approved_fixes(raw_df, audit_log)
+
+                    # District-level fixes (only for aggregate data)
+                    if _is_aggregate_data():
+                        cleaned_df, district_applied = apply_approved_district_fixes(
+                            cleaned_df, audit_log
+                        )
+                        applied_changes = applied_changes + district_applied
 
                     # Extreme preservation enforcement (safety guardrail)
                     guard = ExtremePreservationGuardrail()
@@ -1414,7 +1548,7 @@ with tab3:
             if st.button("↩️ Reset All to Reject", use_container_width=True, key="reset_decisions"):
                 for entry in audit_log:
                     eid = entry["id"]
-                    if entry.get("defect_type") != "LEGITIMATE_EXTREME":
+                    if entry.get("defect_type") not in ("LEGITIMATE_EXTREME", "EXTREME_DEPARTURE"):
                         st.session_state.user_decisions[eid] = "Reject"
                 st.rerun()
 

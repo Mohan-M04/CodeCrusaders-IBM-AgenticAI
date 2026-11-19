@@ -424,10 +424,13 @@ def _check_outliers(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def run_quality_agent(df: pd.DataFrame) -> dict[str, Any]:
+def run_quality_agent(df: pd.DataFrame,
+                      is_aggregate: bool = False) -> dict[str, Any]:
     """
     AGENT 2 – QualityInvestigationAgent.
     Runs 5 deterministic quality checks and uses IBM Granite for triage narrative.
+    When is_aggregate=True, also runs the 4 district-level consistency checks.
+    The 5 daily checks and F1 logic are NEVER modified by this path.
     """
     t0 = time.time()
     checks = {
@@ -441,6 +444,11 @@ def run_quality_agent(df: pd.DataFrame) -> dict[str, Any]:
     total_defects = sum(
         c.get("count", 0) for c in checks.values()
     )
+
+    # ── District-level checks (aggregate data only) ───────────────────────────
+    district_result: dict[str, Any] | None = None
+    if is_aggregate:
+        district_result = run_district_checks(df)
 
     # ── LLM Triage Narrative ─────────────────────────────────────────────────
     summary = {k: {"count": v.get("count", 0),
@@ -483,8 +491,260 @@ def run_quality_agent(df: pd.DataFrame) -> dict[str, Any]:
         "model_used": model_used,
         "total_defects_found": total_defects,
         "checks": checks,
+        "district_checks": district_result,   # None when not aggregate
         "llm_triage": llm_analysis,
         "elapsed_s": round(time.time() - t0, 2),
+    }
+
+
+# ─── District-Level Consistency Checks ───────────────────────────────────────
+# Run ONLY when the loaded file is district-level aggregated data
+# (detected by run_quality_agent receiving is_aggregate=True).
+# Never runs on the daily benchmark dataset.
+
+# Real column names from ka_dist_rainfall_2025.csv (and any same-schema file)
+_DISTRICT_COL      = "district"
+_ANNUAL_NORMAL     = "annual normal"
+_ANNUAL_ACTUAL     = "annual actual"
+_ANNUAL_DEP_PCT    = "annual departure (%)"
+_SEASONAL_ACTUALS  = ["pre monsoon actual", "swm actual", "nem actual"]   # sum → annual actual
+_DEPARTURE_THRESHOLD = 1.0    # percentage points
+_SEASONAL_SUM_TOLERANCE = 0.02  # 2 %
+_EXTREME_DEP_THRESHOLD  = 60.0  # |departure| > 60 % triggers extreme-departure flag
+
+
+def _to_float(val) -> float | None:
+    """Safe coerce to float; return None on failure."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _check_departure_mismatch(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    (a) Recompute (Actual - Normal) / Normal * 100 and flag rows where
+    it differs from the file's Annual Departure (%) by > DEPARTURE_THRESHOLD points.
+    """
+    findings: list[dict] = []
+    required = {_ANNUAL_NORMAL, _ANNUAL_ACTUAL, _ANNUAL_DEP_PCT, _DISTRICT_COL}
+    if not required.issubset(set(df.columns)):
+        return {"check": "departure_mismatch", "count": 0, "details": [],
+                "skipped": True, "skip_reason": f"Required columns missing: {required - set(df.columns)}"}
+
+    for _, row in df.iterrows():
+        district = row.get(_DISTRICT_COL, "?")
+        normal = _to_float(row.get(_ANNUAL_NORMAL))
+        actual = _to_float(row.get(_ANNUAL_ACTUAL))
+        filed  = _to_float(row.get(_ANNUAL_DEP_PCT))
+        if normal is None or actual is None or filed is None:
+            continue
+        if normal == 0:
+            continue
+        recomputed = round((actual - normal) / normal * 100, 1)
+        diff = abs(recomputed - filed)
+        if diff > _DEPARTURE_THRESHOLD:
+            findings.append({
+                "district":           district,
+                "defect_type":        "DEPARTURE_MISMATCH",
+                "field":              _ANNUAL_DEP_PCT,
+                "filed_value":        filed,
+                "recomputed_value":   recomputed,
+                "diff_pct_points":    round(diff, 2),
+                "annual_normal":      normal,
+                "annual_actual":      actual,
+                "reason": (
+                    f"Filed departure {filed}% differs from recomputed "
+                    f"{recomputed}% by {diff:.1f} points "
+                    f"(Normal={normal}, Actual={actual}). "
+                    "Inconsistency to verify — may reflect a rounding convention."
+                ),
+            })
+
+    return {
+        "check":   "departure_mismatch",
+        "count":   len(findings),
+        "details": findings,
+        "skipped": False,
+    }
+
+
+def _check_seasonal_sum_mismatch(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    (b) Sum the seasonal actual columns and flag rows where the sum differs
+    from Annual Actual by more than SEASONAL_SUM_TOLERANCE (2%).
+    Skips gracefully if any seasonal column is absent.
+    """
+    present_seasonals = [c for c in _SEASONAL_ACTUALS if c in df.columns]
+    if not present_seasonals or _ANNUAL_ACTUAL not in df.columns:
+        return {
+            "check":       "seasonal_sum_mismatch",
+            "count":        0,
+            "details":      [],
+            "skipped":      True,
+            "skip_reason":  (
+                f"Seasonal actual columns not found in this file. "
+                f"Expected: {_SEASONAL_ACTUALS}. "
+                f"Present: {present_seasonals}. Skipping seasonal sum check."
+            ),
+        }
+
+    findings: list[dict] = []
+    for _, row in df.iterrows():
+        district = row.get(_DISTRICT_COL, "?")
+        annual   = _to_float(row.get(_ANNUAL_ACTUAL))
+        if annual is None or annual == 0:
+            continue
+        season_vals = [_to_float(row.get(c)) for c in present_seasonals]
+        if any(v is None for v in season_vals):
+            continue
+        season_sum = sum(season_vals)
+        rel_diff = abs(season_sum - annual) / abs(annual)
+        if rel_diff > _SEASONAL_SUM_TOLERANCE:
+            findings.append({
+                "district":           district,
+                "defect_type":        "SEASONAL_SUM_MISMATCH",
+                "field":              "seasonal sum vs annual actual",
+                "filed_value":        annual,
+                "recomputed_value":   round(season_sum, 1),
+                "diff_pct":           round(rel_diff * 100, 1),
+                "seasonal_columns":   present_seasonals,
+                "seasonal_values":    season_vals,
+                "reason": (
+                    f"Sum of seasonal actuals ({season_sum:.1f}) differs from "
+                    f"Annual Actual ({annual}) by {rel_diff*100:.1f}% "
+                    f"(tolerance: {_SEASONAL_SUM_TOLERANCE*100:.0f}%). "
+                    "Inconsistency to verify — sub-season data may use a different scope."
+                ),
+            })
+
+    return {
+        "check":   "seasonal_sum_mismatch",
+        "count":   len(findings),
+        "details": findings,
+        "skipped": False,
+    }
+
+
+def _check_negative_or_missing(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    (c) Flag negative, blank, or non-numeric values in rainfall_mm
+    (annual actual) for district-level data.
+    """
+    if "rainfall_mm" not in df.columns:
+        return {"check": "negative_or_missing", "count": 0, "details": [],
+                "skipped": True, "skip_reason": "No rainfall_mm column found."}
+
+    findings: list[dict] = []
+    for _, row in df.iterrows():
+        district = row.get(_DISTRICT_COL, "?")
+        raw_val  = row.get("rainfall_mm")
+        num_val  = _to_float(raw_val)
+        # Treat both None and NaN as missing
+        is_missing = num_val is None or (num_val != num_val)  # NaN != NaN is True
+        if is_missing:
+            findings.append({
+                "district":    district,
+                "defect_type": "NEGATIVE_OR_MISSING",
+                "field":       "rainfall_mm",
+                "filed_value": None,
+                "reason":      f"Non-numeric or blank annual actual value: '{raw_val}'.",
+            })
+        elif num_val < 0:
+            findings.append({
+                "district":    district,
+                "defect_type": "NEGATIVE_OR_MISSING",
+                "field":       "rainfall_mm",
+                "filed_value": raw_val,
+                "reason":      f"Negative annual actual rainfall ({num_val} mm) is physically impossible.",
+            })
+
+    return {
+        "check":   "negative_or_missing",
+        "count":   len(findings),
+        "details": findings,
+        "skipped": False,
+    }
+
+
+def _check_extreme_departure(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    (d) Flag districts where |Annual Departure %| > EXTREME_DEP_THRESHOLD (60%).
+    Treated as "verify, do not delete" — same as preserved extremes in daily data.
+    """
+    if _ANNUAL_DEP_PCT not in df.columns:
+        return {"check": "extreme_departure", "count": 0, "details": [],
+                "skipped": True, "skip_reason": f"Column '{_ANNUAL_DEP_PCT}' not found."}
+
+    findings: list[dict] = []
+    for _, row in df.iterrows():
+        district = row.get(_DISTRICT_COL, "?")
+        dep = _to_float(row.get(_ANNUAL_DEP_PCT))
+        if dep is None:
+            continue
+        if abs(dep) > _EXTREME_DEP_THRESHOLD:
+            findings.append({
+                "district":    district,
+                "defect_type": "EXTREME_DEPARTURE",
+                "field":       _ANNUAL_DEP_PCT,
+                "filed_value": dep,
+                "reason": (
+                    f"Annual departure {dep:+.1f}% exceeds ±{_EXTREME_DEP_THRESHOLD:.0f}% threshold. "
+                    "Verify against KSNDMC source data — do NOT auto-delete. "
+                    "May reflect genuine drought/flood conditions."
+                ),
+            })
+
+    return {
+        "check":   "extreme_departure",
+        "count":   len(findings),
+        "details": findings,
+        "skipped": False,
+    }
+
+
+def run_district_checks(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Run all 4 district-level consistency checks.
+    Called only when is_aggregate=True; never on daily/benchmark data.
+    Returns a dict keyed by check name, plus a total inconsistencies count.
+    Extreme departures are NOT included in the total (they are preserve-only findings).
+    """
+    # Normalise column names (lowercase + strip) so it works regardless of capitalisation
+    df_norm = df.copy()
+    df_norm.columns = [c.lower().strip() for c in df_norm.columns]
+
+    # After validate_csv_upload, 'annual actual' is renamed to 'rainfall_mm'.
+    # Restore 'annual actual' so the individual check functions find it.
+    if "annual actual" not in df_norm.columns and "rainfall_mm" in df_norm.columns:
+        df_norm["annual actual"] = df_norm["rainfall_mm"]
+
+    # Remove STATE / KARNATAKA summary row
+    if _DISTRICT_COL in df_norm.columns:
+        state_mask = df_norm[_DISTRICT_COL].str.upper().str.strip().isin(
+            ["STATE", "KARNATAKA", "TOTAL"]
+        )
+        df_norm = df_norm[~state_mask].reset_index(drop=True)
+
+    checks = {
+        "departure_mismatch":    _check_departure_mismatch(df_norm),
+        "seasonal_sum_mismatch": _check_seasonal_sum_mismatch(df_norm),
+        "negative_or_missing":   _check_negative_or_missing(df_norm),
+        "extreme_departure":     _check_extreme_departure(df_norm),
+    }
+
+    # Total inconsistencies = mismatches + negatives/missing
+    # (extreme_departure findings are "verify, do not delete" — excluded from defect count)
+    total_inconsistencies = sum(
+        checks[k]["count"]
+        for k in ("departure_mismatch", "seasonal_sum_mismatch", "negative_or_missing")
+    )
+    extreme_departure_count = checks["extreme_departure"]["count"]
+
+    return {
+        "checks":                   checks,
+        "total_inconsistencies":    total_inconsistencies,
+        "extreme_departure_count":  extreme_departure_count,
     }
 
 
@@ -588,6 +848,79 @@ def run_audit_agent(df: pd.DataFrame,
         })
         entry_id += 1
 
+    # ── District-level inconsistencies (aggregate data only) ──────────────────
+    district_checks_result = quality_results.get("district_checks")
+    if district_checks_result:
+        dc = district_checks_result.get("checks", {})
+
+        # (a) departure mismatch → propose corrected departure value
+        for rec in dc.get("departure_mismatch", {}).get("details", []):
+            audit_entries.append({
+                "id": entry_id,
+                "defect_type":     "DEPARTURE_MISMATCH",
+                "station_id":      rec.get("district"),   # district acts as station_id here
+                "date":            "2025-01-01",           # synthetic placeholder date
+                "original_value":  rec.get("filed_value"),
+                "expected_value":  rec.get("recomputed_value"),
+                "field":           rec.get("field"),
+                "reason":          rec.get("reason"),
+                "proposed_action": "Correct to Recomputed Departure (%)",
+                "user_decision":   None,
+                "reversible":      True,
+            })
+            entry_id += 1
+
+        # (b) seasonal sum mismatch → flag only (data may use a different scope)
+        for rec in dc.get("seasonal_sum_mismatch", {}).get("details", []):
+            audit_entries.append({
+                "id": entry_id,
+                "defect_type":     "SEASONAL_SUM_MISMATCH",
+                "station_id":      rec.get("district"),
+                "date":            "2025-01-01",
+                "original_value":  rec.get("filed_value"),
+                "expected_value":  rec.get("recomputed_value"),
+                "field":           rec.get("field"),
+                "reason":          rec.get("reason"),
+                "proposed_action": ACTION_FLAG,
+                "user_decision":   None,
+                "reversible":      True,
+            })
+            entry_id += 1
+
+        # (c) negative or missing → propose null
+        for rec in dc.get("negative_or_missing", {}).get("details", []):
+            audit_entries.append({
+                "id": entry_id,
+                "defect_type":     "NEGATIVE_OR_MISSING",
+                "station_id":      rec.get("district"),
+                "date":            "2025-01-01",
+                "original_value":  rec.get("filed_value"),
+                "expected_value":  None,
+                "field":           rec.get("field"),
+                "reason":          rec.get("reason"),
+                "proposed_action": ACTION_NULL,
+                "user_decision":   None,
+                "reversible":      True,
+            })
+            entry_id += 1
+
+        # (d) extreme departure → always RETAIN (verify only, never auto-delete)
+        for rec in dc.get("extreme_departure", {}).get("details", []):
+            audit_entries.append({
+                "id": entry_id,
+                "defect_type":     "EXTREME_DEPARTURE",
+                "station_id":      rec.get("district"),
+                "date":            "2025-01-01",
+                "original_value":  rec.get("filed_value"),
+                "expected_value":  None,
+                "field":           rec.get("field"),
+                "reason":          rec.get("reason"),
+                "proposed_action": "Verify Against KSNDMC Source — Do Not Delete",
+                "user_decision":   None,
+                "reversible":      False,   # treat like preserved extremes
+            })
+            entry_id += 1
+
     # ── LLM Explanation ───────────────────────────────────────────────────────
     summary_for_llm = [
         {"defect_type": e["defect_type"], "station_id": e["station_id"],
@@ -668,6 +1001,57 @@ def apply_approved_fixes(raw_df: pd.DataFrame,
 
         elif action == ACTION_FLAG:
             # FLAG adds a suffix note — no data mutation
+            applied.append({**entry, "applied": True, "new_value": "flagged_only"})
+
+    return cleaned, applied
+
+
+ACTION_CORRECT_DEPARTURE = "Correct to Recomputed Departure (%)"
+
+
+def apply_approved_district_fixes(raw_df: pd.DataFrame,
+                                   district_audit_log: list[dict]) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Apply only user-APPROVED district-level fixes to a COPY of raw_df.
+    Raw data is NEVER modified.
+    Only DEPARTURE_MISMATCH (correct the value) and NEGATIVE_OR_MISSING (set NaN)
+    are applied. SEASONAL_SUM_MISMATCH is FLAG-only. EXTREME_DEPARTURE is never modified.
+    Returns (cleaned_df, applied_changes).
+    """
+    cleaned = raw_df.copy()
+    applied = []
+
+    approved = [e for e in district_audit_log if e.get("user_decision") == "Approve"]
+
+    for entry in approved:
+        dtype   = entry["defect_type"]
+        sid     = entry["station_id"]   # district name used as station_id
+        action  = entry["proposed_action"]
+
+        if dtype == "EXTREME_DEPARTURE":
+            # Hard guardrail: never modify extreme departure rows
+            continue
+
+        mask = cleaned["station_id"] == sid
+
+        if dtype == "DEPARTURE_MISMATCH" and action == ACTION_CORRECT_DEPARTURE:
+            expected = entry.get("expected_value")
+            if expected is not None and mask.sum() > 0:
+                # Update the annual departure (%) column if it exists
+                dep_col = next(
+                    (c for c in cleaned.columns if "departure" in c.lower() and "annual" in c.lower()),
+                    None
+                )
+                if dep_col:
+                    cleaned.loc[mask, dep_col] = expected
+                    applied.append({**entry, "applied": True, "new_value": expected})
+
+        elif dtype == "NEGATIVE_OR_MISSING" and action == ACTION_NULL:
+            if mask.sum() > 0:
+                cleaned.loc[mask, "rainfall_mm"] = np.nan
+                applied.append({**entry, "applied": True, "new_value": None})
+
+        elif action == ACTION_FLAG or dtype == "SEASONAL_SUM_MISMATCH":
             applied.append({**entry, "applied": True, "new_value": "flagged_only"})
 
     return cleaned, applied
