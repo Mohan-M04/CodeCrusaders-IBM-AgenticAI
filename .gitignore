@@ -1,1 +1,23 @@
+# Environment & secrets
 .env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit cache
+.streamlit/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output files
+cleaned_rainfall_copy.csv
+rainfall_audit_log.json
