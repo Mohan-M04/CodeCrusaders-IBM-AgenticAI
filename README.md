@@ -10,6 +10,12 @@
 </p>
 
 <p align="center">
+  <a href="https://codecrusaders-ibm-agenticai-vxyvbdjkvyu6zus7dpghjt.streamlit.app/">
+    <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Open in Streamlit"/>
+  </a>
+</p>
+
+<p align="center">
   <strong>Inter-Institute IBM Bob Hackathon 2026 · Problem Statement 18</strong><br/>
   Climate Data Engineering · Data Reliability · Auditable Agentic Workflows<br/><br/>
   <strong>Team:</strong> Code Crusaders &nbsp;|&nbsp;
